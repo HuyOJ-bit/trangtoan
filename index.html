@@ -447,6 +447,7 @@ button:focus-visible,input:focus-visible,select:focus-visible,textarea:focus-vis
 const KEY = 'trangToanShop_v13';
 const SESSION = 'trangToanShopSession_v13';
 const LOCAL_BACKUP_KEY = KEY + '_backup';
+const PENDING_SAVE_KEY = KEY + '_pending';
 const SAVE_DEBOUNCE_MS = 450;
 const SAVE_RETRY_MS = 3000;
 
@@ -549,25 +550,51 @@ async function loadFromFirebase(){
     await window.firebaseReady;
     const {doc,getDoc,setDoc,serverTimestamp}=window.firebaseFns;
     const ref=doc(window.firebaseDb,'shopData','main');
+    const pendingRaw=localStorage.getItem(PENDING_SAVE_KEY);
+
+    // Nếu máy này vừa sửa dữ liệu nhưng chưa đồng bộ xong, ưu tiên bản local
+    // và đẩy chính bản đó lên cloud. Điều này ngăn F5 khôi phục dữ liệu cũ.
+    if(pendingRaw){
+      try{
+        const pending=JSON.parse(pendingRaw);
+        state=normalizeState(pending);
+        repairCart();
+        const payload=structuredClone(state);
+        payload.updatedAt=serverTimestamp();
+        await setDoc(ref,payload,{merge:false});
+        writeLocalBackup();
+        localStorage.removeItem(PENDING_SAVE_KEY);
+        lastSavedSnapshot=stateSnapshot(state);
+        setSaveStatus('Đã đồng bộ thay đổi','saved');
+        renderAll();
+        return;
+      }catch(error){
+        console.warn('Không thể khôi phục bản chờ đồng bộ:',error);
+      }
+    }
+
     const snap=await getDoc(ref);
     if(snap.exists()){
       state=normalizeState(snap.data());
       repairCart();
       writeLocalBackup();
+      localStorage.removeItem(PENDING_SAVE_KEY);
       lastSavedSnapshot=stateSnapshot(state);
       setSaveStatus('Đã đồng bộ','saved');
     }else{
       state=normalizeState(state);
       repairCart();
-      await setDoc(ref,{...structuredClone(state),updatedAt:serverTimestamp()});
+      const payload=structuredClone(state);
+      payload.updatedAt=serverTimestamp();
+      await setDoc(ref,payload,{merge:false});
       writeLocalBackup();
+      localStorage.removeItem(PENDING_SAVE_KEY);
       lastSavedSnapshot=stateSnapshot(state);
       setSaveStatus('Đã tạo dữ liệu cloud','saved');
     }
     renderAll();
   }catch(error){
     console.error('Không thể tải dữ liệu Firebase:',error);
-    // Giữ dữ liệu cục bộ để website vẫn hoạt động khi Firebase/mạng lỗi.
     state=normalizeState(state);
     repairCart();
     writeLocalBackup();
@@ -629,6 +656,7 @@ async function flushSave(){
     payload.updatedAt=serverTimestamp();
     await setDoc(doc(window.firebaseDb,'shopData','main'),payload,{merge:false});
     lastSavedSnapshot=snapshot;
+    localStorage.removeItem(PENDING_SAVE_KEY);
     setSaveStatus('Đã lưu vào Firebase','saved');
     if(saveRetryTimer){clearTimeout(saveRetryTimer);saveRetryTimer=null;}
   }catch(error){
@@ -645,6 +673,7 @@ async function flushSave(){
 function save(){
   // Ghi local ngay lập tức, còn Firebase được gom các thay đổi liên tiếp thành 1 lần ghi.
   writeLocalBackup();
+  try { localStorage.setItem(PENDING_SAVE_KEY, stateSnapshot(state)); } catch {}
   setSaveStatus(online ? 'Chờ đồng bộ…' : 'Đã lưu trên máy','busy');
   clearTimeout(saveTimer);
   saveTimer=setTimeout(flushSave,SAVE_DEBOUNCE_MS);
