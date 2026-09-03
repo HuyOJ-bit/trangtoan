@@ -71,6 +71,9 @@ footer{border-top:1px solid var(--line);padding:30px 0;color:var(--muted)}.check
 .checkout-box{width:min(560px,100%);max-height:92vh;overflow:auto;background:var(--card);border:1px solid var(--line);border-radius:20px;padding:24px;box-shadow:0 20px 60px rgba(0,0,0,.2)}
 .checkout-box h2{margin:0}.order-preview{background:color-mix(in srgb,var(--p) 6%,var(--card));border:1px solid var(--line);border-radius:12px;padding:12px;margin:14px 0;line-height:1.6}.required{color:var(--danger)}
 .toast{position:fixed;right:18px;bottom:18px;z-index:200;background:#111827;color:#fff;padding:13px 16px;border-radius:13px;box-shadow:0 18px 50px rgba(0,0,0,.22);font-weight:650;max-width:min(420px,calc(100vw - 36px));animation:toastIn .35s var(--ease)}
+.save-status{font-size:.72rem;font-weight:750;padding:6px 9px;border-radius:999px;border:1px solid var(--line);background:var(--card);color:var(--muted);white-space:nowrap;transition:all .25s ease}.save-status[data-mode=busy]{color:#9a6700;border-color:#f0d58a;background:#fff8df}.save-status[data-mode=saved]{color:var(--ok);border-color:color-mix(in srgb,var(--ok) 25%,var(--line));background:color-mix(in srgb,var(--ok) 7%,var(--card))}.save-status[data-mode=offline]{color:var(--danger);border-color:color-mix(in srgb,var(--danger) 25%,var(--line));background:color-mix(in srgb,var(--danger) 6%,var(--card))}
+@media(max-width:900px){.save-status{display:none}}
+
 
 .preview-gallery{display:flex;gap:8px;flex-wrap:wrap;margin-top:8px}
 .preview-gallery img{width:60px;height:60px;object-fit:cover;border-radius:8px;border:1px solid var(--line)}
@@ -135,7 +138,7 @@ button:focus-visible,input:focus-visible,select:focus-visible,textarea:focus-vis
 <div class="actions">
   <button class="pill" id="themeBtn" title="Đổi giao diện">☀️</button>
   <button class="pill" id="langBtn">EN</button>
-  <span class="who muted" id="who">Chưa đăng nhập</span>
+  <span class="who muted" id="who">Chưa đăng nhập</span><span id="saveStatus" class="save-status" data-mode="saved" title="Trạng thái lưu dữ liệu">Đã lưu</span>
   <button class="btn primary" id="authBtn" data-i18n="loginBtn">Đăng nhập</button>
   <button class="btn secondary hidden" id="logoutBtn" data-i18n="logoutBtn">Thoát</button>
 </div>
@@ -443,6 +446,9 @@ button:focus-visible,input:focus-visible,select:focus-visible,textarea:focus-vis
 <script>
 const KEY = 'trangToanShop_v13';
 const SESSION = 'trangToanShopSession_v13';
+const LOCAL_BACKUP_KEY = KEY + '_backup';
+const SAVE_DEBOUNCE_MS = 450;
+const SAVE_RETRY_MS = 3000;
 
 const i18n = {
   vi: {
@@ -489,15 +495,34 @@ let uploadedImagesCache = [];
 let viewingProductId = null;
 let viewingProductQty = 1;
 let saveTimer = null;
+let saveRetryTimer = null;
 let saveInFlight = false;
 let saveQueued = false;
+let lastSavedSnapshot = '';
+let online = navigator.onLine;
 
 function safeSessionLoad(){
   try { return JSON.parse(localStorage.getItem(SESSION) || 'null'); }
   catch { localStorage.removeItem(SESSION); return null; }
 }
 
-function load() { return structuredClone(defaultState); }
+function load() {
+  try {
+    const candidates = [
+      localStorage.getItem(LOCAL_BACKUP_KEY),
+      localStorage.getItem(KEY)
+    ].filter(Boolean);
+    for (const raw of candidates) {
+      try {
+        const parsed = JSON.parse(raw);
+        if (parsed && typeof parsed === 'object') return normalizeState(parsed);
+      } catch {}
+    }
+  } catch (error) {
+    console.warn('Không thể đọc dữ liệu cục bộ:', error);
+  }
+  return structuredClone(defaultState);
+}
 
 function normalizeState(raw){
   const base = structuredClone(defaultState);
@@ -519,6 +544,7 @@ function normalizeState(raw){
 }
 
 async function loadFromFirebase(){
+  setSaveStatus('Đang tải dữ liệu…','busy');
   try{
     await window.firebaseReady;
     const {doc,getDoc,setDoc,serverTimestamp}=window.firebaseFns;
@@ -526,19 +552,28 @@ async function loadFromFirebase(){
     const snap=await getDoc(ref);
     if(snap.exists()){
       state=normalizeState(snap.data());
+      repairCart();
+      writeLocalBackup();
+      lastSavedSnapshot=stateSnapshot(state);
+      setSaveStatus('Đã đồng bộ','saved');
     }else{
-      let legacy=null;
-      try{legacy=JSON.parse(localStorage.getItem(KEY)||'null')}catch{}
-      state=normalizeState(legacy || defaultState);
-      await setDoc(ref,{...state,updatedAt:serverTimestamp()});
-      localStorage.removeItem(KEY);
+      state=normalizeState(state);
+      repairCart();
+      await setDoc(ref,{...structuredClone(state),updatedAt:serverTimestamp()});
+      writeLocalBackup();
+      lastSavedSnapshot=stateSnapshot(state);
+      setSaveStatus('Đã tạo dữ liệu cloud','saved');
     }
-    repairCart();
     renderAll();
   }catch(error){
     console.error('Không thể tải dữ liệu Firebase:',error);
+    // Giữ dữ liệu cục bộ để website vẫn hoạt động khi Firebase/mạng lỗi.
+    state=normalizeState(state);
+    repairCart();
+    writeLocalBackup();
     renderAll();
-    toast('⚠️ Không thể kết nối Firebase. Kiểm tra Firestore Rules và Internet.');
+    setSaveStatus('Ngoại tuyến — đã lưu trên máy','offline');
+    toast('⚠️ Firebase đang lỗi/kết nối chập chờn. Dữ liệu vẫn được lưu cục bộ.');
   }
 }
 
@@ -550,28 +585,81 @@ function repairCart(){
   }).filter(Boolean);
 }
 
+function stateSnapshot(value){
+  try { return JSON.stringify(value); } catch { return ''; }
+}
+
+function writeLocalBackup(){
+  try{
+    const snapshot=stateSnapshot(state);
+    localStorage.setItem(LOCAL_BACKUP_KEY,snapshot);
+    // Giữ KEY cũ như fallback tương thích, nhưng không dùng nó làm nguồn chính.
+    localStorage.setItem(KEY,snapshot);
+  }catch(error){
+    console.warn('Local backup failed:',error);
+  }
+}
+
+function setSaveStatus(text, mode='saved'){
+  const el=document.getElementById('saveStatus');
+  if(!el) return;
+  el.textContent=text;
+  el.dataset.mode=mode;
+}
+
 async function flushSave(){
-  if(saveInFlight){saveQueued=true;return;}
+  if(saveInFlight){ saveQueued=true; return; }
+  if(!online){
+    setSaveStatus('Ngoại tuyến — chờ mạng','offline');
+    return;
+  }
+  const snapshot=stateSnapshot(state);
+  if(snapshot && snapshot===lastSavedSnapshot){
+    setSaveStatus('Đã lưu','saved');
+    return;
+  }
+  // Lưu cục bộ trước để không mất dữ liệu kể cả khi cloud lỗi.
+  writeLocalBackup();
   saveInFlight=true; saveQueued=false;
+  setSaveStatus('Đang lưu…','busy');
   try{
     await window.firebaseReady;
     const {doc,setDoc,serverTimestamp}=window.firebaseFns;
     const payload=structuredClone(state);
     payload.updatedAt=serverTimestamp();
-    await setDoc(doc(window.firebaseDb,'shopData','main'),payload);
+    await setDoc(doc(window.firebaseDb,'shopData','main'),payload,{merge:false});
+    lastSavedSnapshot=snapshot;
+    setSaveStatus('Đã lưu vào Firebase','saved');
+    if(saveRetryTimer){clearTimeout(saveRetryTimer);saveRetryTimer=null;}
   }catch(error){
     console.error('Lưu Firebase thất bại:',error);
-    toast('⚠️ Không thể lưu dữ liệu lên Firebase.');
+    setSaveStatus('Chưa đồng bộ cloud — đã lưu máy','offline');
+    clearTimeout(saveRetryTimer);
+    saveRetryTimer=setTimeout(()=>{saveRetryTimer=null;flushSave();},SAVE_RETRY_MS);
   }finally{
     saveInFlight=false;
-    if(saveQueued) flushSave();
+    if(saveQueued){ saveQueued=false; clearTimeout(saveTimer); saveTimer=setTimeout(flushSave,SAVE_DEBOUNCE_MS); }
   }
 }
 
 function save(){
+  // Ghi local ngay lập tức, còn Firebase được gom các thay đổi liên tiếp thành 1 lần ghi.
+  writeLocalBackup();
+  setSaveStatus(online ? 'Chờ đồng bộ…' : 'Đã lưu trên máy','busy');
   clearTimeout(saveTimer);
-  saveTimer=setTimeout(flushSave,180);
+  saveTimer=setTimeout(flushSave,SAVE_DEBOUNCE_MS);
 }
+
+window.addEventListener('online',()=>{
+  online=true;
+  setSaveStatus('Có mạng — đang đồng bộ…','busy');
+  clearTimeout(saveRetryTimer); saveRetryTimer=null;
+  flushSave();
+});
+window.addEventListener('offline',()=>{
+  online=false;
+  setSaveStatus('Ngoại tuyến — đã lưu trên máy','offline');
+});
 
 function applyAppearance(){
   const root=document.documentElement;
@@ -1052,13 +1140,41 @@ function deleteProduct(id){
   save(); renderAll(); toast('Đã xóa sản phẩm');
 }
 
-document.getElementById('pImageFile').onchange = e => {
-  uploadedImagesCache = []; document.getElementById('pImagePreview').innerHTML = '';
-  Array.from(e.target.files).forEach(f => {
-    const r = new FileReader();
-    r.onload = ev => { uploadedImagesCache.push(ev.target.result); const img = document.createElement('img'); img.src = ev.target.result; document.getElementById('pImagePreview').appendChild(img); };
-    r.readAsDataURL(f);
+async function compressImageFile(file,maxSize=1400,quality=.78){
+  if(!file.type.startsWith('image/')) return null;
+  return await new Promise((resolve,reject)=>{
+    const url=URL.createObjectURL(file);
+    const img=new Image();
+    img.onload=()=>{
+      try{
+        const ratio=Math.min(1,maxSize/Math.max(img.width,img.height));
+        const canvas=document.createElement('canvas');
+        canvas.width=Math.max(1,Math.round(img.width*ratio));
+        canvas.height=Math.max(1,Math.round(img.height*ratio));
+        const ctx=canvas.getContext('2d',{alpha:false});
+        ctx.drawImage(img,0,0,canvas.width,canvas.height);
+        URL.revokeObjectURL(url);
+        resolve(canvas.toDataURL('image/webp',quality));
+      }catch(err){URL.revokeObjectURL(url);reject(err);}
+    };
+    img.onerror=()=>{URL.revokeObjectURL(url);reject(new Error('Không đọc được ảnh'));};
+    img.src=url;
   });
+}
+
+document.getElementById('pImageFile').onchange = async e => {
+  uploadedImagesCache = []; document.getElementById('pImagePreview').innerHTML = '';
+  const files=Array.from(e.target.files || []).slice(0,8);
+  for(const file of files){
+    try{
+      const data=await compressImageFile(file);
+      if(!data) continue;
+      uploadedImagesCache.push(data);
+      const img=document.createElement('img'); img.src=data; img.loading='lazy'; img.title='Ảnh đã được tối ưu';
+      document.getElementById('pImagePreview').appendChild(img);
+    }catch(err){ toast('⚠️ Không thể xử lý một ảnh.'); }
+  }
+  if(uploadedImagesCache.length) toast('✅ Ảnh đã được nén để lưu nhanh hơn.');
 };
 
 document.getElementById('productForm').onsubmit = e => {
@@ -1180,6 +1296,8 @@ document.getElementById('registerForm').onsubmit = e => {
 applyTheme();
 applyLang();
 renderAll();
+writeLocalBackup();
+setSaveStatus(online ? 'Đang kết nối…' : 'Ngoại tuyến — đã lưu trên máy','busy');
 
 
 // UX safeguards
@@ -1190,8 +1308,8 @@ document.addEventListener('error',e=>{
   const el=e.target;
   if(el instanceof HTMLImageElement && !el.dataset.fallback){ el.dataset.fallback='1'; el.src='https://via.placeholder.com/640x480?text=Trang+Toan+Shop'; }
 },true);
-window.addEventListener('beforeunload',()=>{ if(saveInFlight||saveQueued) flushSave(); });
-document.addEventListener('visibilitychange',()=>{ if(document.visibilityState==='hidden' && saveTimer){ clearTimeout(saveTimer); saveTimer=null; flushSave(); }});
+window.addEventListener('beforeunload',()=>{ writeLocalBackup(); });
+document.addEventListener('visibilitychange',()=>{ if(document.visibilityState==='hidden'){ writeLocalBackup(); if(saveTimer){ clearTimeout(saveTimer); saveTimer=null; } if(online) flushSave(); }});
 
 // Đồng bộ toàn bộ dữ liệu với Firestore của Firebase project mới.
 loadFromFirebase();
