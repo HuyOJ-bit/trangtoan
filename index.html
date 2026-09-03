@@ -599,7 +599,7 @@ async function loadFromFirebase(){
     repairCart();
     writeLocalBackup();
     renderAll();
-    setSaveStatus('Ngoại tuyến — đã lưu trên máy','offline');
+    setSaveStatus('','offline');
     toast('⚠️ Firebase đang lỗi/kết nối chập chờn. Dữ liệu vẫn được lưu cục bộ.');
   }
 }
